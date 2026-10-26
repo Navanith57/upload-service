@@ -6,10 +6,16 @@ import {
 } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, Types } from 'mongoose';
-import { promises as fs } from 'fs';
-import { join } from 'path';
-import { Image, ImageVisibility } from './schemas/image.schema';
+import { promises as fs } from 'node:fs';
+import { extname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
+import { StorageService } from '../storage/storage.service';
+import {
+    Image,
+    ImageStorageProvider,
+    ImageVisibility,
+} from './schemas/image.schema';
 
 @Injectable()
 export class ImagesService {
@@ -18,7 +24,8 @@ export class ImagesService {
     constructor(
         @InjectModel(Image.name)
         private readonly imageModel: Model<Image>,
-    ) { }
+      private readonly storageService: StorageService,
+  ) { }
 
     async create(
         file: Express.Multer.File,
@@ -29,35 +36,29 @@ export class ImagesService {
             throw new NotFoundException('User not found');
         }
 
-        try {
-            const image = await this.imageModel.create({
-                originalName: file.originalname,
-                storageName: file.filename,
-                mimeType: file.mimetype,
-                size: file.size,
-                visibility,
-                ownerId: new Types.ObjectId(ownerId),
-            });
+      if (!file.buffer || file.buffer.length === 0) {
+          throw new NotFoundException('Uploaded image data is missing');
+      }
 
-            return {
-                id: image._id.toString(),
-                originalName: image.originalName,
-                mimeType: image.mimeType,
-                size: image.size,
-                visibility: image.visibility,
-                createdAt: image.createdAt,
-            };
-        } catch (error) {
-            // Avoid leaving an orphaned file when metadata creation fails.
-            await fs.unlink(join(this.uploadDir, file.filename)).catch(() => { });
-            throw error;
-        }
-    }
+      const storageName = `${randomUUID()}${extname(file.originalname).toLowerCase()}`;
 
-    async findMetadata(id: string, requesterId?: string) {
-        const image = await this.findImage(id);
+      // Upload the bytes first. MongoDB will store the object's metadata.
+      await this.storageService.upload(
+          storageName,
+          file.buffer,
+          file.mimetype,
+      );
 
-        this.assertCanAccess(image, requesterId);
+      try {
+          const image = await this.imageModel.create({
+              originalName: file.originalname,
+          storageName,
+          storageProvider: ImageStorageProvider.RUSTFS,
+          mimeType: file.mimetype,
+          size: file.size,
+          visibility,
+          ownerId: new Types.ObjectId(ownerId),
+      });
 
         return {
             id: image._id.toString(),
@@ -67,126 +68,149 @@ export class ImagesService {
             visibility: image.visibility,
             createdAt: image.createdAt,
         };
-    }
+    } catch (error) {
+          // Compensate if MongoDB fails after the object was uploaded.
+          await this.storageService.delete(storageName).catch(() => undefined);
+          throw error;
+      }
+  }
+
+    async findMetadata(id: string, requesterId?: string) {
+        const image = await this.findImage(id);
+      this.assertCanAccess(image, requesterId);
+
+      return {
+          id: image._id.toString(),
+          originalName: image.originalName,
+          mimeType: image.mimeType,
+          size: image.size,
+          visibility: image.visibility,
+          createdAt: image.createdAt,
+      };
+  }
 
     async findMyImages(ownerId: string) {
         return this.imageModel
             .find({ ownerId: new Types.ObjectId(ownerId) })
-            .select('-storageName -ownerId')
-            .sort({ createdAt: -1 })
-            .lean()
-            .exec();
-    }
+          .select('-storageName -storageProvider -ownerId')
+          .sort({ createdAt: -1 })
+          .lean()
+          .exec();
+  }
 
     async getFile(id: string, requesterId?: string) {
         const image = await this.findImage(id);
+      this.assertCanAccess(image, requesterId);
 
-        this.assertCanAccess(image, requesterId);
+      if (image.storageProvider === ImageStorageProvider.RUSTFS) {
+          const buffer = await this.storageService.download(image.storageName);
 
-        const path = join(this.uploadDir, image.storageName);
+          return {
+              buffer,
+              mimeType: image.mimeType,
+              originalName: image.originalName,
+          };
+      }
 
-        try {
-            await fs.access(path);
-        } catch {
-            throw new NotFoundException('Image file not found');
-        }
+      // Existing LOCAL records continue using their original disk files.
+      const path = join(this.uploadDir, image.storageName);
 
-        return {
-            path,
-            mimeType: image.mimeType,
-            originalName: image.originalName,
-        };
-    }
+      try {
+          await fs.access(path);
+      } catch {
+          throw new NotFoundException('Image file not found');
+      }
+
+      return {
+          path,
+          mimeType: image.mimeType,
+          originalName: image.originalName,
+      };
+  }
 
     async delete(id: string, requesterId: string) {
         const image = await this.findImage(id);
 
-        if (image.ownerId.toString() !== requesterId) {
-            throw new ForbiddenException('You cannot delete this image');
-        }
+      if (image.ownerId.toString() !== requesterId) {
+          throw new ForbiddenException('You cannot delete this image');
+      }
 
-        // Remove metadata only after attempting to remove the file.
-        try {
-            await fs.unlink(join(this.uploadDir, image.storageName));
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-                throw error;
-            }
-        }
-
-        await this.imageModel.deleteOne({ _id: image._id }).exec();
-
-        return { message: 'Image deleted successfully' };
+      if (image.storageProvider === ImageStorageProvider.RUSTFS) {
+          await this.storageService.delete(image.storageName);
+      } else {
+          try {
+              await fs.unlink(join(this.uploadDir, image.storageName));
+          } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+                  throw error;
+              }
+          }
     }
+
+      await this.imageModel.deleteOne({ _id: image._id }).exec();
+
+      return { message: 'Image deleted successfully' };
+  }
 
     private async findImage(id: string) {
         if (!Types.ObjectId.isValid(id)) {
             throw new NotFoundException('Image not found');
         }
 
-        const image = await this.imageModel.findById(id).exec();
+      const image = await this.imageModel.findById(id).exec();
 
-        if (!image) {
-            throw new NotFoundException('Image not found');
-        }
+      if (!image) {
+          throw new NotFoundException('Image not found');
+      }
 
-        return image;
-    }
+      return image;
+  }
 
     private assertCanAccess(image: Image, requesterId?: string) {
-        if (image.visibility === ImageVisibility.PUBLIC) {
-            return;
-        }
+      if (image.visibility === ImageVisibility.PUBLIC) return;
 
-        if (!requesterId || image.ownerId.toString() !== requesterId) {
-            throw new ForbiddenException('You cannot access this image');
-        }
-    }
-
+      if (!requesterId || image.ownerId.toString() !== requesterId) {
+          throw new ForbiddenException('You cannot access this image');
+      }
+  }
 
     async checkStorageConsistency() {
-        // 1. Read the filenames expected by MongoDB.
-        const records = await this.imageModel
-            .find({})
-            .select('storageName')
-            .lean()
-            .exec();
+      const records = await this.imageModel
+        .find({ storageProvider: ImageStorageProvider.LOCAL })
+        .select('storageName')
+        .lean()
+        .exec();
 
-        const databaseFiles = new Set(
-            records.map((record) => record.storageName),
-        );
+      const databaseFiles = new Set(
+          records.map((record) => record.storageName),
+      );
 
-        // 2. Read the actual files in the uploads directory.
-        const entries = await fs.readdir(this.uploadDir, {
-            withFileTypes: true,
-        });
+      const entries = await fs.readdir(this.uploadDir, {
+          withFileTypes: true,
+      });
 
-        const diskFiles = new Set(
-            entries
-                .filter((entry) => entry.isFile())
-                .map((entry) => entry.name),
-        );
+      const diskFiles = new Set(
+          entries
+              .filter((entry) => entry.isFile())
+              .map((entry) => entry.name),
+      );
 
-        // 3. Find database records whose files are missing.
-        const missingFiles = [...databaseFiles].filter(
-            (filename) => !diskFiles.has(filename),
-        );
+      const missingFiles = [...databaseFiles].filter(
+          (filename) => !diskFiles.has(filename),
+      );
 
-        // 4. Find disk files with no database record.
-        const untrackedFiles = [...diskFiles].filter(
-            (filename) => !databaseFiles.has(filename),
-        );
+      const untrackedFiles = [...diskFiles].filter(
+          (filename) => !databaseFiles.has(filename),
+      );
 
-        // 5. Return a report. Do not modify or delete anything.
-        return {
-            checkedAt: new Date().toISOString(),
-            databaseRecordCount: databaseFiles.size,
-            diskFileCount: diskFiles.size,
-            missingFiles,
-            untrackedFiles,
-            healthy: missingFiles.length === 0 &&
-                untrackedFiles.length === 0,
-        };
-    }
-
+      return {
+          checkedAt: new Date().toISOString(),
+          databaseRecordCount: databaseFiles.size,
+          diskFileCount: diskFiles.size,
+          missingFiles,
+          untrackedFiles,
+          healthy:
+              missingFiles.length === 0 && untrackedFiles.length === 0,
+      };
+  }
 }

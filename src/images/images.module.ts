@@ -6,6 +6,7 @@ import { ImagesService } from './images.service';
 import { Image, ImageSchema } from './schemas/image.schema';
 import { PassportModule } from '@nestjs/passport';
 import { JwtStrategy } from './jwt.strategy';
+import { StorageModule } from '../storage/storage.module';
 
 @Module({
   imports: [
@@ -13,6 +14,7 @@ import { JwtStrategy } from './jwt.strategy';
     MongooseModule.forFeature([
       { name: Image.name, schema: ImageSchema },
     ]),
+    StorageModule,
   ],
   controllers: [ImagesController],
   providers: [ImagesService, JwtStrategy],

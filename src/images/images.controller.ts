@@ -15,10 +15,7 @@ import {
 import type { Response } from 'express';
 import { AuthGuard } from '@nestjs/passport';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { diskStorage } from 'multer';
-import { randomUUID } from 'node:crypto';
-import { readFile, unlink } from 'node:fs/promises';
-import { extname, join } from 'node:path';
+import { memoryStorage } from 'multer';
 
 import { UploadImageDto } from './dto/upload-image.dto';
 import { ImagesService } from './images.service';
@@ -45,7 +42,10 @@ function detectImageMimeType(bytes: Buffer): string | undefined {
     if (
         bytes.length >= 8 &&
         bytes.subarray(0, 8).equals(
-            Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+            Buffer.from([
+                0x89, 0x50, 0x4e, 0x47,
+                0x0d, 0x0a, 0x1a, 0x0a,
+            ]),
         )
     ) {
         return 'image/png';
@@ -71,12 +71,7 @@ export class ImagesController {
     @UseGuards(AuthGuard('jwt'))
     @UseInterceptors(
         FileInterceptor('file', {
-            storage: diskStorage({
-                destination: join(process.cwd(), 'uploads'),
-                filename: (_req, file, callback) => {
-                    callback(null, `${randomUUID()}${extname(file.originalname)}`);
-                },
-            }),
+            storage: memoryStorage(),
             limits: { fileSize: 5 * 1024 * 1024 },
             fileFilter: (_req, file, callback) => {
                 if (
@@ -103,18 +98,13 @@ export class ImagesController {
             throw new BadRequestException('An image file is required');
         }
 
-        let detectedMimeType: string | undefined;
-
-        try {
-            const bytes = await readFile(file.path);
-            detectedMimeType = detectImageMimeType(bytes);
-        } catch {
-            await unlink(file.path).catch(() => undefined);
-            throw new BadRequestException('Unable to read uploaded image');
+        if (!file.buffer || file.buffer.length === 0) {
+            throw new BadRequestException('Uploaded image data is missing');
         }
 
+        const detectedMimeType = detectImageMimeType(file.buffer);
+
         if (!detectedMimeType || detectedMimeType !== file.mimetype) {
-            await unlink(file.path).catch(() => undefined);
             throw new BadRequestException(
                 'File contents do not match the declared image format',
             );
@@ -126,6 +116,7 @@ export class ImagesController {
             dto.visibility ?? ImageVisibility.PRIVATE,
         );
     }
+
     @Get('me')
     @UseGuards(AuthGuard('jwt'))
     async getMyImages(
@@ -148,6 +139,11 @@ export class ImagesController {
 
         response.setHeader('Content-Type', file.mimeType);
         response.setHeader('Content-Disposition', 'inline');
+
+        // RustFS files are returned as buffers; legacy local files use paths.
+        if ('buffer' in file) {
+            return response.send(file.buffer);
+        }
 
         return response.sendFile(file.path);
     }

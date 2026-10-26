@@ -1,4 +1,4 @@
-import { promises as fs } from 'node:fs';
+
 import { getModelToken } from '@nestjs/mongoose';
 import { Test, TestingModule } from '@nestjs/testing';
 import { Types } from 'mongoose';
@@ -12,7 +12,12 @@ import {
 } from 'vitest';
 
 import { ImagesService } from './images.service';
-import { Image, ImageVisibility } from './schemas/image.schema';
+import {
+  Image,
+  ImageStorageProvider,
+  ImageVisibility,
+} from './schemas/image.schema';
+import { StorageService } from '../storage/storage.service';
 
 describe('ImagesService', () => {
   let service: ImagesService;
@@ -23,13 +28,19 @@ describe('ImagesService', () => {
     deleteOne: vi.fn(),
   };
 
+  const storageService = {
+    upload: vi.fn(),
+    download: vi.fn(),
+    delete: vi.fn(),
+  };
+
   const ownerId = '507f1f77bcf86cd799439011';
 
   const file = {
     originalname: 'photo.png',
-    filename: 'test-storage-name.png',
     mimetype: 'image/png',
     size: 100,
+    buffer: Buffer.from('test image bytes'),
   } as Express.Multer.File;
 
   beforeEach(async () => {
@@ -37,12 +48,19 @@ describe('ImagesService', () => {
     imageModel.findById.mockReset();
     imageModel.deleteOne.mockReset();
 
+    storageService.upload.mockReset();
+    storageService.download.mockReset();
+    storageService.delete.mockReset();
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         ImagesService,
         {
           provide: getModelToken(Image.name),
           useValue: imageModel,
+        },
+        {
+          provide: StorageService,
+          useValue: storageService,
         },
       ],
     }).compile();
@@ -54,17 +72,17 @@ describe('ImagesService', () => {
     vi.restoreAllMocks();
   });
 
-  it('creates image metadata with the authenticated owner ID', async () => {
+
+  it('creates RustFS image metadata with the authenticated owner ID', async () => {
     const createdAt = new Date('2026-01-01T00:00:00.000Z');
 
-    imageModel.create.mockResolvedValue({
+    storageService.upload.mockResolvedValue(undefined);
+
+    imageModel.create.mockImplementation(async (metadata) => ({
       _id: new Types.ObjectId('507f1f77bcf86cd799439012'),
-      originalName: file.originalname,
-      mimeType: file.mimetype,
-      size: file.size,
-      visibility: ImageVisibility.PRIVATE,
+      ...metadata,
       createdAt,
-    });
+    }));
 
     const result = await service.create(
       file,
@@ -72,14 +90,23 @@ describe('ImagesService', () => {
       ImageVisibility.PRIVATE,
     );
 
-    expect(imageModel.create).toHaveBeenCalledWith({
+    expect(storageService.upload).toHaveBeenCalledWith(
+      expect.stringMatching(/^[0-9a-f-]+\.png$/i),
+      file.buffer,
+      'image/png',
+    );
+
+    expect(imageModel.create).toHaveBeenCalledWith(
+      expect.objectContaining({
       originalName: 'photo.png',
-      storageName: 'test-storage-name.png',
+        storageName: expect.stringMatching(/^[0-9a-f-]+\.png$/i),
+        storageProvider: ImageStorageProvider.RUSTFS,
       mimeType: 'image/png',
       size: 100,
       visibility: ImageVisibility.PRIVATE,
       ownerId: new Types.ObjectId(ownerId),
-    });
+      }),
+    );
 
     expect(result).toEqual({
       id: '507f1f77bcf86cd799439012',
@@ -91,6 +118,7 @@ describe('ImagesService', () => {
     });
   });
 
+
   it('rejects an invalid owner ID before writing metadata', async () => {
     await expect(
       service.create(file, 'not-an-object-id', ImageVisibility.PRIVATE),
@@ -99,23 +127,25 @@ describe('ImagesService', () => {
     expect(imageModel.create).not.toHaveBeenCalled();
   });
 
-  it('removes the uploaded file when metadata creation fails', async () => {
+
+  it('deletes the RustFS object when metadata creation fails', async () => {
     const databaseError = new Error('Database unavailable');
 
+    storageService.upload.mockResolvedValue(undefined);
     imageModel.create.mockRejectedValue(databaseError);
-
-    const unlinkSpy = vi
-      .spyOn(fs, 'unlink')
-      .mockResolvedValue(undefined);
+    storageService.delete.mockResolvedValue(undefined);
 
     await expect(
       service.create(file, ownerId, ImageVisibility.PRIVATE),
     ).rejects.toBe(databaseError);
 
-    expect(unlinkSpy).toHaveBeenCalledWith(
-      expect.stringContaining('test-storage-name.png'),
+    expect(storageService.upload).toHaveBeenCalledOnce();
+
+    expect(storageService.delete).toHaveBeenCalledWith(
+      expect.stringMatching(/^[0-9a-f-]+\.png$/i),
     );
   });
+
 
   it('denies another user access to a private image', async () => {
     const imageId = '507f1f77bcf86cd799439012';

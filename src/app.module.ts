@@ -12,6 +12,7 @@ export const { ObserveModule, ObserveInstrument } = createObserveModule();
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
+      envFilePath: ['.env', '.env.rustfs'],
     }),
 
     MongooseModule.forRootAsync({

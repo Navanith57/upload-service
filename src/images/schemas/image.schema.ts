@@ -9,6 +9,11 @@ export enum ImageVisibility {
     PRIVATE = 'private',
 }
 
+export enum ImageStorageProvider {
+    LOCAL = 'local',
+    RUSTFS = 'rustfs',
+}
+
 @Schema({ timestamps: true })
 export class Image {
     @Prop({ required: true })
@@ -16,6 +21,13 @@ export class Image {
 
     @Prop({ required: true, unique: true })
     storageName: string;
+
+    @Prop({
+        required: true,
+        enum: ImageStorageProvider,
+        default: ImageStorageProvider.LOCAL,
+    })
+    storageProvider: ImageStorageProvider;
 
     @Prop({ required: true })
     mimeType: string;
