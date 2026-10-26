@@ -142,4 +142,51 @@ export class ImagesService {
             throw new ForbiddenException('You cannot access this image');
         }
     }
+
+
+    async checkStorageConsistency() {
+        // 1. Read the filenames expected by MongoDB.
+        const records = await this.imageModel
+            .find({})
+            .select('storageName')
+            .lean()
+            .exec();
+
+        const databaseFiles = new Set(
+            records.map((record) => record.storageName),
+        );
+
+        // 2. Read the actual files in the uploads directory.
+        const entries = await fs.readdir(this.uploadDir, {
+            withFileTypes: true,
+        });
+
+        const diskFiles = new Set(
+            entries
+                .filter((entry) => entry.isFile())
+                .map((entry) => entry.name),
+        );
+
+        // 3. Find database records whose files are missing.
+        const missingFiles = [...databaseFiles].filter(
+            (filename) => !diskFiles.has(filename),
+        );
+
+        // 4. Find disk files with no database record.
+        const untrackedFiles = [...diskFiles].filter(
+            (filename) => !databaseFiles.has(filename),
+        );
+
+        // 5. Return a report. Do not modify or delete anything.
+        return {
+            checkedAt: new Date().toISOString(),
+            databaseRecordCount: databaseFiles.size,
+            diskFileCount: diskFiles.size,
+            missingFiles,
+            untrackedFiles,
+            healthy: missingFiles.length === 0 &&
+                untrackedFiles.length === 0,
+        };
+    }
+
 }
